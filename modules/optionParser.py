@@ -2,7 +2,7 @@ import os
 import json
 from typing import Dict
 
-
+# Функция для чтения опций из файла
 def parseOptions(filepath: str) -> Dict:
     options = {}
 

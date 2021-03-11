@@ -31,9 +31,7 @@ __copyright__ = '(C) 2021 by gwolf'
 __revision__ = '$Format:%H$'
 
 import os
-from typing import Dict, Any
-
-import numpy as np
+from typing import Dict, Any, Union
 
 import processing
 from processing.modeler.ModelerDialog import ModelerDialog
@@ -41,90 +39,59 @@ from qgis.PyQt.QtCore import QCoreApplication, QVariant
 from qgis.core import (QgsProcessing,
                        QgsFeatureSink,
                        QgsProcessingAlgorithm,
-                       QgsProcessingParameterFeatureSource,
+                       QgsProcessingParameterFeatureSource, QgsFeatureSource, QgsProcessingParameterFolderDestination,
                        QgsProcessingParameterFeatureSink, QgsProcessingContext, QgsProcessingFeedback,
                        QgsProcessingParameterDistance, QgsProcessingParameterCrs, QgsProcessingParameterNumber,
                        QgsProcessingMultiStepFeedback, QgsCoordinateReferenceSystem, QgsProcessingUtils, QgsExpression,
                        QgsFeatureRequest, QgsFeature, QgsVectorLayer, QgsWkbTypes, QgsVectorDataProvider, QgsField,
-                       QgsGeometry, QgsRasterLayer, QgsRasterDataProvider, QgsFields)
+                       QgsGeometry, QgsRasterLayer, QgsRasterDataProvider, QgsFields, QgsProcessingParameterRasterLayer,
+                       QgsProcessingFeatureSourceDefinition, QgsProject, QgsMapLayerStore)
 
 from ...modules.optionParser import parseOptions
+from ...modules.rle_functions import convertRasterToNumpyArray, rle_encode
 
 options = parseOptions(__file__)
 
 
-def convertRasterToNumpyArray(lyr: QgsRasterLayer) -> np.array:
-    provider: QgsRasterDataProvider = lyr.dataProvider()
-
-    block = provider.block(1, lyr.extent(), lyr.width(), lyr.height())
-    arr = np.zeros((lyr.height(), lyr.width()), dtype=int)
-
-    for i in range(lyr.width()):
-        for j in range(lyr.height()):
-            arr[i, j] = block.value(i, j)
-
-    return arr
-
-
-def rle_encode(img: np.array) -> str:
-    '''
-    img: numpy array, 1 - mask, 0 - background
-    Returns run length as string formated
-    '''
-    pixels = img.flatten()
-    pixels = np.concatenate([[0], pixels, [0]])
-    runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
-    runs[1::2] -= runs[::2]
-    return ' '.join(str(x) for x in runs)
-
-
 class RunLengthEncoding(QgsProcessingAlgorithm):
-    """
-    This is an example algorithm that takes a vector layer and
-    creates a new identical one.
+    SAMPLES = 'SAMPLES'  # Входной слой
+    MOSAIC = 'MOSAIC'  # слой растровой мозаики
+    CRS = 'CRS'  # Система координат
+    HORRESOLUTION = 'HORRESOLUTION'  # Горизонтальное разрешение в единицах проекции
+    VERTRESOLUTION = 'VERTRESOLUTION'  # Вертикальное разрешение в единицах проекции
+    WIDTH = 'WIDTH'  # Ширина тайла в пикселях
+    HEIGHT = 'HEIGHT'  # Высота тайла в пикселях
+    INTERSECTION = 'INTERSECTION'  # Слой SAMPLES с образцами, распределенными по сетке тайлов GRID
+    GRID = 'GRID'  # Сетка тайлов
+    RLE = 'RLE'  # Описание RLE
+    FOLDER = 'FOLDER'
 
-    It is meant to be used as an example of how to create your own
-    algorithms and explain methods and variables used to do it. An
-    algorithm like this will be available in all elements, and there
-    is not need for additional work.
-
-    All Processing algorithms should extend the QgsProcessingAlgorithm
-    class.
-    """
-
-    SAMPLES = 'SAMPLES'
-
-    CRS = 'CRS'
-
-    HORRESOLUTION = 'HORRESOLUTION'
-    VERTRESOLUTION = 'VERTRESOLUTION'
-
-    WIDTH = 'WIDTH'
-    HEIGHT = 'HEIGHT'
-
-    INTERSECTION = 'INTERSECTION'
-    GRID = 'GRID'
-    RLE = 'RLE'
-
-    def __init__(self, plugin_dir: str):
+    def __init__(self, plugin_dir: str) -> None:
         self.__plugin_dir = plugin_dir
 
+        # Загружаем готовую модель из файла
         self.create_grid = ModelerDialog()
         self.create_grid.loadModel(os.path.join(self.__plugin_dir, r"qgis_models", "create_grid.model3"))
 
         super().__init__()
 
-    def initAlgorithm(self, config: Dict[str, Any]):
-        """
-        Here we define the inputs and output of the algorithm, along
-        with some other properties.
-        """
+    def initAlgorithm(self, config: Dict[str, Any]) -> None:
+
+        # Описываем входные параметры
 
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 name=self.SAMPLES,
                 description='Input layer',
                 types=[QgsProcessing.TypeVectorAnyGeometry]
+            )
+        )
+
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                name=self.MOSAIC,
+                description='Rater mosaic layer',
+                optional=True
             )
         )
 
@@ -173,6 +140,15 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
         )
 
         self.addParameter(
+            QgsProcessingParameterFolderDestination(
+                name=self.FOLDER,
+                description='Output folder for mosail tiles',
+                defaultValue=options.get(self.FOLDER, None),
+                optional=True
+            )
+        )
+
+        self.addParameter(
             QgsProcessingParameterFeatureSink(
                 name=self.INTERSECTION,
                 description='Samples per tiles',
@@ -204,26 +180,31 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
 
     def processAlgorithm(self, parameters: Dict[str, Any],
                          context: QgsProcessingContext,
-                         feedback: QgsProcessingFeedback):
-        """
-        Here is where the processing itself takes place.
-        """
+                         feedback: QgsProcessingFeedback) -> Union[dict, Dict[str, Any]]:
+
+        # Словарь в котором будут сохраняться результаты работы алгоритма
         result = dict()
-        # Retrieve the feature source and sink. The 'dest_id' variable is used
-        # to uniquely identify the feature sink, and must be included in the
-        # dictionary returned by the processAlgorithm function.
-        source = self.parameterAsSource(parameters, self.SAMPLES, context)
+
+        # Получаем переданные на вход параметры
+        source: QgsFeatureSource = self.parameterAsSource(parameters, self.SAMPLES, context)
+        whole_mosaic: QgsRasterLayer = self.parameterAsRasterLayer(parameters, self.MOSAIC, context)
         horresolution: float = self.parameterAsDouble(parameters, self.HORRESOLUTION, context)
         vertresolution: float = self.parameterAsDouble(parameters, self.VERTRESOLUTION, context)
         width: int = self.parameterAsInt(parameters, self.WIDTH, context)
         height: int = self.parameterAsInt(parameters, self.HEIGHT, context)
         dest_crs: QgsCoordinateReferenceSystem = self.parameterAsCrs(parameters, self.CRS, context)
 
+        if self.FOLDER in parameters and parameters[self.FOLDER]:
+            folder = self.parameterAsFileOutput(parameters, self.FOLDER, context)
+        else:
+            folder = None
+
         model_feedback = QgsProcessingMultiStepFeedback(2, feedback)
 
         if feedback.isCanceled():
-            return {}
+            return result
 
+        # Запускаем загруженный из файла алгоритм, который создает слои INTERSECTION и GRID
         proc_result = processing.run(self.create_grid.model(), {
             self.SAMPLES: parameters[self.SAMPLES],
             self.CRS: dest_crs,
@@ -232,24 +213,26 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
             self.WIDTH: width,
             self.HEIGHT: height,
             'native:intersection_1:{}'.format(self.INTERSECTION): 'TEMPORARY_OUTPUT',
+            # 'native:intersection_1:{}'.format(self.INTERSECTION): parameters[self.INTERSECTION],
             'native:renametablefield_1:{}'.format(self.GRID): 'TEMPORARY_OUTPUT'
+            # 'native:renametablefield_1:{}'.format(self.GRID): parameters[self.GRID]
         },
                                      context=context,
                                      feedback=model_feedback,
                                      is_child_algorithm=True)
 
-        print(proc_result)
-
+        # Получаем результаты работы алгоритма
         temp_intersection: QgsVectorLayer = context.takeResultLayer(
             proc_result['native:intersection_1:{}'.format(self.INTERSECTION)])
 
         temp_grid: QgsVectorLayer = context.takeResultLayer(
             proc_result['native:renametablefield_1:{}'.format(self.GRID)])
 
-
+        # Создаем выходные слои, записываем в них features и сохраняем с словарь результатов result
         (intersection, intersection_id) = self.parameterAsSink(parameters, self.INTERSECTION,
-                context, temp_intersection.fields(), temp_intersection.wkbType(), temp_intersection.sourceCrs())
-
+                                                               context, temp_intersection.fields(),
+                                                               temp_intersection.wkbType(),
+                                                               temp_intersection.sourceCrs())
 
         (grid, grid_id) = self.parameterAsSink(parameters, self.GRID,
                                                context, temp_grid.fields(), temp_grid.wkbType(), temp_grid.sourceCrs())
@@ -257,105 +240,148 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
         intersection.addFeatures(temp_intersection.getFeatures())
         grid.addFeatures(temp_grid.getFeatures())
 
-        result.update({self.INTERSECTION: intersection_id, self.GRID: grid_id})
+        # result.update({
+        #     self.INTERSECTION: proc_result['native:intersection_1:{}'.format(self.INTERSECTION)],
+        #     self.GRID: proc_result['native:renametablefield_1:{}'.format(self.GRID)]
+        # })
+
+        result.update({
+            self.INTERSECTION: intersection_id,
+            self.GRID: grid_id
+        })
 
         model_feedback.setCurrentStep(1)
         if feedback.isCanceled():
             return result
 
-
-
-
-
-        # Compute the number of steps to display within the progress bar and
-        # get features from source
         total = 100.0 / temp_grid.featureCount() if temp_grid.featureCount() else 0
-        # features = source.getFeatures()
 
-        templayer = QgsVectorLayer('{}?crs={}'.format(QgsWkbTypes.displayString(temp_grid.wkbType()), dest_crs.authid()), 'temp', 'memory')
-        data_provider: QgsVectorDataProvider = templayer.dataProvider()
-
-        data_provider.addAttributes(
-            [QgsField("sample_id", QVariant.Int),
-             QgsField("tile_id", QVariant.Int)])
-
-        print(templayer.crs())
-        print(templayer.crs().authid())
-
+        # Поля для выходного слоя RLE
         rle_fields = QgsFields()
         rle_fields.append(QgsField("Image_Label", QVariant.String))
         rle_fields.append(QgsField("EncodedPixels", QVariant.String))
 
+        # Выходной слой RLE
         (rle, rle_id) = self.parameterAsSink(parameters, self.RLE,
-                                               context, rle_fields, temp_grid.wkbType(), QgsCoordinateReferenceSystem())
+                                             context, rle_fields, temp_grid.wkbType(), QgsCoordinateReferenceSystem())
         rle: QgsFeatureSink
 
+        store: QgsMapLayerStore = QgsProject.instance().layerStore()
+
+        store.addMapLayer(temp_intersection)
+        store.addMapLayer(temp_grid)
+
+        # Цикл по каждому тайлу из GRID
         for current, tile_feat in enumerate(temp_grid.getFeatures()):
             tile_feat: QgsFeature
-            # Stop the algorithm if cancel button has been clicked
+
             if feedback.isCanceled():
                 return result
 
-            # tile_id = tile_feat["tile_id"]
-
+            # для каждого тайла создаем запрос по которому будут запрошены соответствующие feature из INTERSECTION
             expression = QgsExpression().createFieldEqualityExpression("tile_id", tile_feat["tile_id"])
             request = QgsFeatureRequest()
-            # request.setFlags(QgsFeatureRequest.NoGeometry)
             request.setFilterExpression(expression)
 
+            # Цикл по всем feature в INTERSECTION
             for samle_feat in temp_intersection.getFeatures(request):
                 samle_feat: QgsFeature
-                # feat_id = samle_feat.id()
 
-                templayer.startEditing()
-                data_provider.addFeatures([samle_feat])
-                templayer.commitChanges()
-                # geom: QgsGeometry = tile_feat.geometry()
+                # выделяем в слое INTERSECTION текущую feature, чтобы только ее передать в алгоритм обрезки растра
+                temp_intersection.selectByIds([samle_feat.id()])
 
-                raster = processing.run("gdal:rasterize",
-                               {'BURN': 1,
-                                'DATA_TYPE': 0,
-                                'EXTENT': tile_feat.geometry().boundingBox(),
-                                'EXTRA': '',
-                                'FIELD': '',
-                                'HEIGHT': vertresolution,
-                                'INIT': None,
-                                'INPUT': templayer,
-                                'INVERT': False,
-                                'NODATA': 0,
-                                'OPTIONS': 'NBITS=1',
-                                'OUTPUT': 'TEMPORARY_OUTPUT',
-                                'UNITS': 1,
-                                'WIDTH': horresolution},
-                               context=context,
-                               feedback=model_feedback,
-                               is_child_algorithm=True)['OUTPUT']
-                print(raster)
-                raster = QgsProcessingUtils.mapLayerFromString(raster, context)
-                print(raster)
+                # Превращаем текущую feature из INTERSECTION в растр, экстент растра задаем по текущему тайлу
+                bin_raster = processing.run("gdal:rasterize",
+                                            {'BURN': 1,
+                                             'DATA_TYPE': 0,
+                                             'EXTENT': tile_feat.geometry().boundingBox(),
+                                             'EXTRA': '',
+                                             'FIELD': '',
+                                             'HEIGHT': vertresolution,
+                                             'INIT': None,
+                                             'INPUT': QgsProcessingFeatureSourceDefinition(temp_intersection.id(),
+                                                                                           selectedFeaturesOnly=True),
+                                             'INVERT': False,
+                                             'NODATA': 0,
+                                             'OPTIONS': 'NBITS=1',
+                                             'OUTPUT': 'TEMPORARY_OUTPUT',
+                                             'UNITS': 1,
+                                             'WIDTH': horresolution},
+                                            context=context,
+                                            feedback=model_feedback,
+                                            is_child_algorithm=True)['OUTPUT']
 
-                raster_rle_string = rle_encode(convertRasterToNumpyArray(raster))
+                # Получаем результат работы алгоритма в виде растра
+                bin_raster: QgsRasterLayer = QgsProcessingUtils.mapLayerFromString(bin_raster, context)
 
+                # Получаем строку RLE
+                raster_rle_string = rle_encode(convertRasterToNumpyArray(bin_raster))
+
+                # Записываем строку с описанием RLE в слой RLE
                 feat = QgsFeature(rle_fields)
                 feat["Image_Label"] = tile_feat["tile_id"]
                 feat["EncodedPixels"] = raster_rle_string
                 rle.addFeatures([feat])
 
-                templayer.startEditing()
-                data_provider.deleteFeatures([samle_feat.id()])
-                templayer.commitChanges()
+                if feedback.isCanceled():
+                    return result
+
+            # если указаны мозаика и выходная папка, то обрезаем мозаику по текущему тайлу GRID
+            if whole_mosaic and folder:
+
+                if feedback.isCanceled():
+                    return result
+
+                # выделяем в слое GRID текущий тайл, чтобы только его передать в алгоритм обрезки растра
+                temp_grid.selectByIds([tile_feat.id()])
+
+                mosaic_tile_temp_raster = processing.run("gdal:cliprasterbymasklayer",
+                               {'ALPHA_BAND': False,
+                                'CROP_TO_CUTLINE': True,
+                                'DATA_TYPE': 0,
+                                'EXTRA': '',
+                                'INPUT': whole_mosaic,
+                                'KEEP_RESOLUTION': False,
+                                # 'MASK': single_grid,
+                                'MASK': QgsProcessingFeatureSourceDefinition(temp_grid.id(), selectedFeaturesOnly=True),
+                                'MULTITHREADING': False,
+                                'NODATA': None,
+                                'OPTIONS': '',
+                                'OUTPUT': 'TEMPORARY_OUTPUT',
+                                # 'OUTPUT': os.path.join(folder, str(tile_feat["tile_id"]).zfill(5)) + '.tif',
+                                'SET_RESOLUTION': True,
+                                'SOURCE_CRS': None,
+                                'TARGET_CRS': None,
+                                'X_RESOLUTION': abs(whole_mosaic.rasterUnitsPerPixelX()),
+                                'Y_RESOLUTION': abs(whole_mosaic.rasterUnitsPerPixelX())},
+                               context=context,
+                               feedback=model_feedback,
+                               is_child_algorithm=True)["OUTPUT"]
+
+                if feedback.isCanceled():
+                    return result
+
+                processing.run("saga:resampling",
+                               {'INPUT': mosaic_tile_temp_raster,
+                                'KEEP_TYPE': True,
+                                'SCALE_UP': 5,
+                                'SCALE_DOWN': 3,
+                                'TARGET_USER_XMIN TARGET_USER_XMAX TARGET_USER_YMIN TARGET_USER_YMAX': tile_feat.geometry().boundingBox(),
+                                'TARGET_USER_SIZE': 30,
+                                'TARGET_USER_FITS': 0,
+                                'TARGET_TEMPLATE': bin_raster,
+                                'OUTPUT': os.path.join(folder, str(tile_feat["tile_id"]).zfill(5)) + '.tif'},
+                               context=context,
+                               feedback=model_feedback,
+                               is_child_algorithm=True
+                               )["OUTPUT"]
 
             model_feedback.setProgress(int(current * total))
 
+        store.removeMapLayer(temp_intersection)
+        store.removeMapLayer(temp_grid)
         model_feedback.setCurrentStep(2)
 
-
-        # Return the results of the algorithm. In this case our only result is
-        # the feature sink which contains the processed features, but some
-        # algorithms may return multiple feature sinks, calculated numeric
-        # statistics, etc. These should all be included in the returned
-        # dictionary, with keys matching the feature corresponding parameter
-        # or output names.
         result.update({self.RLE: rle_id})
         return result
 
