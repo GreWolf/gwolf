@@ -41,16 +41,17 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingAlgorithm,
                        QgsProcessingParameterFeatureSource, QgsFeatureSource, QgsProcessingParameterFolderDestination,
                        QgsProcessingParameterFeatureSink, QgsProcessingContext, QgsProcessingFeedback,
-                       QgsProcessingParameterDistance, QgsProcessingParameterCrs, QgsProcessingParameterNumber,
+                       QgsProcessingParameterCrs, QgsProcessingParameterNumber,
                        QgsProcessingMultiStepFeedback, QgsCoordinateReferenceSystem, QgsProcessingUtils, QgsExpression,
-                       QgsFeatureRequest, QgsFeature, QgsVectorLayer, QgsWkbTypes, QgsVectorDataProvider, QgsField,
-                       QgsGeometry, QgsRasterLayer, QgsRasterDataProvider, QgsFields, QgsProcessingParameterRasterLayer,
+                       QgsFeatureRequest, QgsFeature, QgsVectorLayer, QgsField,
+                       QgsRasterLayer, QgsFields, QgsProcessingParameterRasterLayer,
                        QgsProcessingFeatureSourceDefinition, QgsProject, QgsMapLayerStore, QgsRectangle, QgsPoint,
-                       QgsRasterPipe, QgsRasterFileWriter)
+                       QgsProcessingParameterBoolean)
 
 from ...modules.optionParser import parseOptions
-from ...modules.rle_functions import convertRasterToNumpyArray, rle_encode
+from ...modules.rle_functions import convertRasterToNumpyArray, rle_encode, save_raster
 
+# загружаем настройки по умолчанию
 options = parseOptions(__file__)
 
 
@@ -63,6 +64,7 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
     WIDTH = 'WIDTH'  # Ширина тайла в пикселях
     HEIGHT = 'HEIGHT'  # Высота тайла в пикселях
     INTERSECTION = 'INTERSECTION'  # Слой SAMPLES с образцами, распределенными по сетке тайлов GRID
+    SAVEONESAMPLE = 'SAVEONESAMPLE'
     GRID = 'GRID'  # Сетка тайлов
     RLE = 'RLE'  # Описание RLE
     FOLDER = 'FOLDER'  # Папка в которую будут сохраняться порезанная мозаика
@@ -70,13 +72,11 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
     def __init__(self, plugin_dir: str) -> None:
         self.__plugin_dir = plugin_dir
 
-        # self.create_grid = ModelerDialog()
-        # self.create_grid.loadModel(os.path.join(self.__plugin_dir, r"qgis_models", "create_grid.model3"))
-
-        # Загружаем готовую модель из файла
+        # Загружаем модель для генерации грида из файла
         self.grid_model = ModelerDialog()
         self.grid_model.loadModel(os.path.join(self.__plugin_dir, r"qgis_models", "grid.model3"))
 
+        # Загружаем модель для генерации слоя intersection из файла
         self.intersection_model = ModelerDialog()
         self.intersection_model.loadModel(os.path.join(self.__plugin_dir, r"qgis_models", "intersection.model3"))
 
@@ -155,6 +155,13 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
             )
         )
 
+        self.addParameter(QgsProcessingParameterBoolean(
+            name=self.SAVEONESAMPLE,
+            description='Save one sample as raster',
+            defaultValue=options.get(self.SAVEONESAMPLE, None),
+            optional=False
+        ))
+
         self.addParameter(
             QgsProcessingParameterFeatureSink(
                 name=self.INTERSECTION,
@@ -211,13 +218,12 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
         else:
             folder = None
 
-        model_feedback = QgsProcessingMultiStepFeedback(2, feedback)
+        saveonesample: bool = self.parameterAsBoolean(parameters, self.SAVEONESAMPLE, context)
 
+        step = 0
+        model_feedback = QgsProcessingMultiStepFeedback(4, feedback)
         if feedback.isCanceled():
             return result
-
-        print('source', source)
-        print('parameters[self.SAMPLES]', parameters[self.SAMPLES])
 
         # Запускаем загруженный из файла алгоритм, который создает слои INTERSECTION и GRID
         temp_grid_id = processing.run(self.grid_model.model(),
@@ -233,14 +239,10 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
                                       feedback=model_feedback,
                                       is_child_algorithm=True)['native:renametablefield_1:{}'.format(self.GRID)]
 
+        step += 1
+        model_feedback.setCurrentStep(step)
         if feedback.isCanceled():
             return result
-
-        print('temp_grid_id', temp_grid_id)
-
-        # Получаем результаты работы алгоритма
-        # temp_intersection: QgsVectorLayer = context.takeResultLayer(
-        #     proc_result['native:intersection_1:{}'.format(self.INTERSECTION)])
 
         temp_grid: QgsVectorLayer = context.takeResultLayer(temp_grid_id)
 
@@ -253,11 +255,10 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
             translated_grid_id = processing.run("native:translategeometry",
                                                 {
                                                     'INPUT': temp_grid,
-                                                    # 'INPUT': proc_result['native:renametablefield_1:{}'.format(self.GRID)],
                                                     'DELTA_X': (
                                                                            mosaic_extent.xMaximum() - first_point.x()) % horresolution,
                                                     'DELTA_Y': (
-                                                                       mosaic_extent.yMaximum() - first_point.y()) % vertresolution,
+                                                                           mosaic_extent.yMaximum() - first_point.y()) % vertresolution,
                                                     'DELTA_Z': 0,
                                                     'DELTA_M': 0,
                                                     'OUTPUT': 'TEMPORARY_OUTPUT'
@@ -270,6 +271,11 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
         else:
             translated_grid_id = temp_grid_id
             translated_grid = temp_grid
+
+        step += 1
+        model_feedback.setCurrentStep(step)
+        if feedback.isCanceled():
+            return result
 
         temp_intersection_id = processing.run(self.intersection_model.model(),
                                               {'CRS': dest_crs,
@@ -298,24 +304,15 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
         intersection.addFeatures(temp_intersection.getFeatures())
         grid.addFeatures(translated_grid.getFeatures())
 
-        # result.update({
-        #     self.INTERSECTION: proc_result['native:intersection_1:{}'.format(self.INTERSECTION)],
-        #     self.GRID: proc_result['native:renametablefield_1:{}'.format(self.GRID)]
-        # })
-
         result.update({
             self.INTERSECTION: intersection_id,
-            # self.INTERSECTION: proc_result['native:intersection_1:{}'.format(self.INTERSECTION)],
             self.GRID: grid_id
         })
 
-        model_feedback.setCurrentStep(1)
+        step += 1
+        model_feedback.setCurrentStep(step)
         if feedback.isCanceled():
             return result
-
-        # total = 100.0 / translated_grid.featureCount() if translated_grid.featureCount() else 0
-
-        # print('total', total)
 
         # Поля для выходного слоя RLE
         rle_fields = QgsFields()
@@ -340,7 +337,6 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
         # Цикл по каждому тайлу из GRID
         for current, tile_feat in enumerate(translated_grid.getFeatures()):
 
-            print('current', current)
             tile_feat: QgsFeature
 
             if feedback.isCanceled():
@@ -382,21 +378,9 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
                 # Получаем результат работы алгоритма в виде растра
                 bin_raster: QgsRasterLayer = QgsProcessingUtils.mapLayerFromString(bin_raster, context)
 
-                if first and folder:
+                if first and folder and saveonesample:
                     first = False
-
-                    renderer = bin_raster.renderer()
-                    provider = bin_raster.dataProvider()
-
-                    pipe = QgsRasterPipe()
-                    pipe.set(provider.clone())
-                    pipe.set(renderer.clone())
-
-                    file_writer = QgsRasterFileWriter(
-                        os.path.join(folder, str(tile_feat["tile_id"]).zfill(5)) + '_sample.tif', )
-                    file_writer.Mode(1)
-
-                    file_writer.writeRaster(pipe, provider.xSize(), provider.ySize(), provider.extent(), provider.crs())
+                    save_raster(bin_raster, folder, str(tile_feat["tile_id"]).zfill(5) + '_sample.tif')
 
                 # Получаем строку RLE
                 raster_rle_string = rle_encode(convertRasterToNumpyArray(bin_raster))
@@ -449,26 +433,13 @@ class RunLengthEncoding(QgsProcessingAlgorithm):
                 if feedback.isCanceled():
                     return result
 
-                # processing.run("saga:resampling",
-                #                {'INPUT': mosaic_tile_temp_raster,
-                #                 'KEEP_TYPE': True,
-                #                 'SCALE_UP': 5,
-                #                 'SCALE_DOWN': 3,
-                #                 'TARGET_USER_XMIN TARGET_USER_XMAX TARGET_USER_YMIN TARGET_USER_YMAX': tile_feat.geometry().boundingBox(),
-                #                 'TARGET_USER_SIZE': 30,
-                #                 'TARGET_USER_FITS': 0,
-                #                 'TARGET_TEMPLATE': bin_raster,
-                #                 'OUTPUT': os.path.join(folder, str(tile_feat["tile_id"]).zfill(5)) + '.tif'},
-                #                context=context,
-                #                feedback=model_feedback,
-                #                is_child_algorithm=True
-                #                )["OUTPUT"]
-
-            # model_feedback.setProgress(int(current * total))
-
         store.removeMapLayer(temp_intersection)
         store.removeMapLayer(translated_grid)
-        model_feedback.setCurrentStep(2)
+
+        step += 1
+        model_feedback.setCurrentStep(step)
+        if feedback.isCanceled():
+            return result
 
         result.update({self.RLE: rle_id})
         return result

@@ -37,5 +37,3 @@ def classFactory(iface):  # pylint: disable=invalid-name
     #
     from .gwolf import GWolf
     return GWolf(iface)
-
-print("sdf")

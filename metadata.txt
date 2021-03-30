@@ -6,7 +6,7 @@
 name=GWolf
 qgisMinimumVersion=3.0
 description=GWolf tools
-version=0.2.1
+version=0.3.0
 author=gwolf
 email=grey_wolf.88@mail.ru
 

@@ -1,5 +1,5 @@
 import numpy as np
-from qgis.core import QgsRasterLayer, QgsRasterDataProvider
+from qgis.core import QgsRasterLayer, QgsRasterDataProvider, QgsRasterPipe, QgsRasterFileWriter
 
 
 # Функция конвертации растра в массив numpy
@@ -15,6 +15,7 @@ def convertRasterToNumpyArray(lyr: QgsRasterLayer) -> np.array:
 
     return arr
 
+
 # Функция генерации строки RLE из массива numpy
 def rle_encode(img: np.array) -> str:
     '''
@@ -26,3 +27,18 @@ def rle_encode(img: np.array) -> str:
     runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
     runs[1::2] -= runs[::2]
     return ' '.join(str(x) for x in runs)
+
+
+# функция сохранения растра в файл
+def save_raster(rater: QgsRasterLayer, folder: str, name: str) -> None:
+    renderer = rater.renderer()
+    provider = rater.dataProvider()
+
+    pipe = QgsRasterPipe()
+    pipe.set(provider.clone())
+    pipe.set(renderer.clone())
+
+    file_writer = QgsRasterFileWriter(np.os.path.join(folder, name))
+    file_writer.Mode(1)
+
+    file_writer.writeRaster(pipe, provider.xSize(), provider.ySize(), provider.extent(), provider.crs())
