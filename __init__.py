@@ -27,13 +27,12 @@ __date__ = '2021-03-10'
 __copyright__ = '(C) 2021 by gwolf'
 
 
-# noinspection PyPep8Naming
-def classFactory(iface):  # pylint: disable=invalid-name
+def classFactory(iface):
     """Load RunLengthEncoding class from file RunLengthEncoding.
 
     :param iface: A QGIS interface instance.
     :type iface: QgsInterface
     """
-    #
+
     from .gwolf import GWolf
     return GWolf(iface)
